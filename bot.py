@@ -1,248 +1,225 @@
 import asyncio
 import logging
 from datetime import datetime
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.errors import FloodWait
+from telethon import TelegramClient, events
+from telethon.tl.types import ChannelParticipantCreator
+from telethon.tl.functions.channels import GetParticipantsRequest
+from telethon.tl.types import ChannelParticipantsAdmins
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Настройка логирования
+# Логирование
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Константы из .env
+# Константы
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
-SESSION_NAME = os.getenv('SESSION_NAME', 'my_account')
+PHONE = os.getenv('PHONE')
 TARGET_BOT = os.getenv('TARGET_BOT', 'GardenHorizonsBot')
-ALLOWED_CREATOR = os.getenv('ALLOWED_CREATOR', 'mellfreezy')
+ALLOWED_CREATOR = os.getenv('ALLOWED_CREATOR', 'mellfreezy').lower().replace('@', '')
 
-# Хранилище
-registered_channels = set()
-last_stock_message = None
-last_gear_message = None
-waiting_for_response = False
+# Клиент
+client = TelegramClient('session', API_ID, API_HASH)
 
-# Создаем клиент
-app = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
+# Состояние
+pending_response = None
+stock_received = False
 
 
 async def get_valid_channels():
     """Получение каналов где создатель - разрешенный пользователь"""
-    valid = []
+    valid_channels = []
     
-    async for dialog in app.get_dialogs():
-        if dialog.chat.type in ["channel", "supergroup"]:
+    async for dialog in client.iter_dialogs():
+        if dialog.is_channel:
             try:
-                async for member in app.get_chat_members(dialog.chat.id, filter="administrators"):
-                    if member.status.name == "OWNER":
-                        if member.user.username and member.user.username.lower() == ALLOWED_CREATOR.lower():
-                            valid.append(dialog.chat.id)
-                            logger.info(f"✅ Канал найден: {dialog.chat.title}")
+                participants = await client(GetParticipantsRequest(
+                    channel=dialog.entity,
+                    filter=ChannelParticipantsAdmins(),
+                    offset=0,
+                    limit=100,
+                    hash=0
+                ))
+                
+                for user, participant in zip(participants.users, participants.participants):
+                    if isinstance(participant, ChannelParticipantCreator):
+                        username = user.username
+                        if username and username.lower() == ALLOWED_CREATOR:
+                            valid_channels.append(dialog.entity)
+                            logger.info(f"✅ Канал: {dialog.name}")
                         break
+                        
             except Exception as e:
-                logger.debug(f"Пропуск {dialog.chat.id}: {e}")
+                logger.debug(f"Пропуск {dialog.name}: {e}")
     
-    return valid
-
-
-async def remove_inline_keyboard(text: str) -> str:
-    """Возвращает текст сообщения (кнопки не копируются при отправке текста)"""
-    return text if text else ""
+    return valid_channels
 
 
 async def send_to_channels(text: str):
-    """Отправка сообщения в каналы"""
+    """Отправка в каналы"""
+    if not text:
+        return
+        
     channels = await get_valid_channels()
     
     if not channels:
-        logger.warning("Нет доступных каналов")
+        logger.warning("Нет каналов для отправки")
         return
     
-    for channel_id in channels:
+    for channel in channels:
         try:
-            await app.send_message(channel_id, text)
-            logger.info(f"✅ Отправлено в канал {channel_id}")
+            await client.send_message(channel, text)
+            logger.info(f"📤 Отправлено в: {channel.title}")
             await asyncio.sleep(1)
-        except FloodWait as e:
-            logger.warning(f"FloodWait: ждем {e.value} сек")
-            await asyncio.sleep(e.value)
         except Exception as e:
-            logger.error(f"Ошибка отправки в {channel_id}: {e}")
+            logger.error(f"Ошибка: {e}")
 
 
-async def interact_with_target_bot():
-    """Взаимодействие с целевым ботом"""
-    global waiting_for_response, last_stock_message, last_gear_message
+async def interact_with_bot():
+    """Взаимодействие с ботом"""
+    global pending_response, stock_received
     
     try:
-        logger.info(f"🤖 Отправляем /start в @{TARGET_BOT}")
-        await app.send_message(TARGET_BOT, "/start")
-        waiting_for_response = "start"
+        logger.info(f"🤖 Начинаем взаимодействие с @{TARGET_BOT}")
+        
+        # Отправляем /start
+        await client.send_message(TARGET_BOT, '/start')
+        pending_response = "menu"
+        stock_received = False
+        
+        logger.info("📤 Отправлен /start")
         
     except Exception as e:
-        logger.error(f"Ошибка взаимодействия с ботом: {e}")
+        logger.error(f"Ошибка: {e}")
 
 
-@app.on_message(filters.chat(TARGET_BOT) & filters.incoming)
-async def handle_bot_response(client: Client, message: Message):
-    """Обработка ответов от целевого бота"""
-    global waiting_for_response, last_stock_message, last_gear_message
+@client.on(events.NewMessage(from_users=TARGET_BOT))
+async def handle_response(event):
+    """Обработка ответов от бота"""
+    global pending_response, stock_received
     
-    logger.info(f"📨 Получено сообщение от @{TARGET_BOT}")
+    message = event.message
+    text = message.text or message.raw_text or ""
     
-    if message.reply_markup:
-        # Ищем кнопку "Просмотреть сток" или похожую
-        for row in message.reply_markup.inline_keyboard:
+    logger.info(f"📨 Ответ от бота: {text[:50]}...")
+    
+    # Проверяем наличие кнопок
+    if message.buttons:
+        logger.info(f"🔘 Найдено кнопок: {len(message.buttons)}")
+        
+        for row in message.buttons:
             for button in row:
-                button_text = button.text.lower()
+                btn_text = button.text.lower()
+                logger.info(f"   Кнопка: {button.text}")
                 
-                if waiting_for_response == "start":
-                    # Ищем кнопку со стоком
-                    if "сток" in button_text or "stock" in button_text or "просмотр" in button_text:
-                        logger.info(f"🔘 Нажимаем кнопку: {button.text}")
+                # Этап 1: Ищем кнопку "Просмотреть сток"
+                if pending_response == "menu":
+                    if "сток" in btn_text or "stock" in btn_text or "просмотр" in btn_text:
+                        logger.info(f"🔘 Нажимаем: {button.text}")
                         await asyncio.sleep(1)
-                        
-                        if button.callback_data:
-                            await message.click(button.callback_data)
-                        else:
-                            await message.click(button.text)
-                        
-                        waiting_for_response = "stock"
+                        await button.click()
+                        pending_response = "stock"
                         return
                 
-                elif waiting_for_response == "stock":
-                    # Это ответ на "Просмотреть сток" - сохраняем и ищем Gear
-                    last_stock_message = message.text or message.caption or ""
-                    
-                    if last_stock_message:
-                        logger.info("📦 Получен сток, отправляем в каналы")
-                        await send_to_channels(last_stock_message)
+                # Этап 2: Получили сток, ищем Gear
+                if pending_response == "stock" and not stock_received:
+                    # Сначала отправляем текст стока в каналы
+                    if text:
+                        logger.info("📦 Отправляем сток в каналы")
+                        await send_to_channels(text)
+                        stock_received = True
                     
                     # Ищем кнопку Gear
-                    if "gear" in button_text:
-                        logger.info(f"🔘 Нажимаем кнопку: {button.text}")
+                    if "gear" in btn_text:
+                        logger.info(f"🔘 Нажимаем: {button.text}")
                         await asyncio.sleep(1)
-                        
-                        if button.callback_data:
-                            await message.click(button.callback_data)
-                        else:
-                            await message.click(button.text)
-                        
-                        waiting_for_response = "gear"
+                        await button.click()
+                        pending_response = "gear"
                         return
-    
-    # Если это ответ на gear или просто текстовое сообщение
-    if waiting_for_response == "stock" and not message.reply_markup:
-        last_stock_message = message.text or message.caption or ""
-        if last_stock_message:
-            logger.info("📦 Получен сток, отправляем в каналы")
-            await send_to_channels(last_stock_message)
-        waiting_for_response = None
         
-    elif waiting_for_response == "gear":
-        last_gear_message = message.text or message.caption or ""
-        if last_gear_message:
-            logger.info("⚙️ Получен gear, отправляем в каналы")
-            await send_to_channels(last_gear_message)
-        waiting_for_response = None
+        # Если получили сток но не нашли Gear
+        if pending_response == "stock" and not stock_received and text:
+            logger.info("📦 Отправляем сток в каналы (без Gear)")
+            await send_to_channels(text)
+            stock_received = True
+            pending_response = None
     
-    # Если есть кнопка Gear в текущем сообщении
-    if message.reply_markup and waiting_for_response == "stock":
-        for row in message.reply_markup.inline_keyboard:
-            for button in row:
-                if "gear" in button.text.lower():
-                    # Сохраняем текущее сообщение как сток
-                    last_stock_message = message.text or message.caption or ""
-                    if last_stock_message:
-                        await send_to_channels(last_stock_message)
-                    
-                    logger.info(f"🔘 Нажимаем Gear: {button.text}")
-                    await asyncio.sleep(1)
-                    
-                    if button.callback_data:
-                        await message.click(button.callback_data)
-                    else:
-                        await message.click(button.text)
-                    
-                    waiting_for_response = "gear"
-                    return
+    else:
+        # Сообщение без кнопок
+        if pending_response == "stock" and not stock_received:
+            logger.info("📦 Сток без кнопок, отправляем")
+            await send_to_channels(text)
+            stock_received = True
+            pending_response = None
+            
+        elif pending_response == "gear":
+            logger.info("⚙️ Gear получен, отправляем")
+            await send_to_channels(text)
+            pending_response = None
 
 
-async def wait_until_next_interval():
+async def wait_for_next_interval():
     """Ожидание до следующего 5-минутного интервала"""
     now = datetime.now()
-    current_minute = now.minute
-    current_second = now.second
-    current_microsecond = now.microsecond
     
-    # Следующий интервал кратный 5
-    next_interval = ((current_minute // 5) + 1) * 5
-    
-    if next_interval >= 60:
-        minutes_to_wait = 60 - current_minute
-    else:
-        minutes_to_wait = next_interval - current_minute
-    
-    seconds_to_wait = (minutes_to_wait * 60) - current_second - (current_microsecond / 1000000)
+    # Вычисляем секунды до следующего интервала
+    minutes_passed = now.minute % 5
+    seconds_passed = minutes_passed * 60 + now.second
+    seconds_to_wait = 300 - seconds_passed  # 5 минут = 300 секунд
     
     if seconds_to_wait <= 0:
-        seconds_to_wait = 300  # 5 минут
+        seconds_to_wait = 300
     
-    next_time = datetime.now().replace(
-        minute=(current_minute // 5 + 1) * 5 % 60,
-        second=0,
-        microsecond=0
-    )
-    logger.info(f"⏰ Следующая публикация примерно в {next_time.strftime('%H:%M')}")
+    next_minute = ((now.minute // 5) + 1) * 5 % 60
+    logger.info(f"⏰ Следующий запуск в XX:{next_minute:02d}:00 (через {seconds_to_wait} сек)")
     
     await asyncio.sleep(seconds_to_wait)
 
 
-async def auto_post_loop():
-    """Основной цикл автопостинга"""
-    await asyncio.sleep(5)  # Даем время на инициализацию
-    
+async def auto_loop():
+    """Основной цикл"""
     logger.info("🚀 Автопостинг запущен!")
     
-    # Ждем до первого интервала
-    await wait_until_next_interval()
+    # Ждем первый интервал
+    await wait_for_next_interval()
     
     while True:
         try:
-            logger.info(f"=== 🔄 Цикл публикации {datetime.now().strftime('%H:%M:%S')} ===")
-            await interact_with_target_bot()
+            logger.info(f"{'='*40}")
+            logger.info(f"🔄 Цикл: {datetime.now().strftime('%H:%M:%S')}")
+            
+            await interact_with_bot()
+            
+            # Даем время на получение ответов
+            await asyncio.sleep(30)
             
         except Exception as e:
             logger.error(f"Ошибка в цикле: {e}")
         
-        # Ждем 5 минут
-        await asyncio.sleep(300)
-
-
-@app.on_message(filters.command("start") & filters.me)
-async def my_start(client: Client, message: Message):
-    """Ручной запуск"""
-    await message.reply("✅ Userbot активен!\nАвтопостинг работает каждые 5 минут.")
+        # Ждем до следующего интервала
+        await wait_for_next_interval()
 
 
 async def main():
     """Главная функция"""
-    await app.start()
-    logger.info(f"✅ Userbot запущен как @{(await app.get_me()).username}")
+    # Подключаемся
+    await client.start(phone=PHONE)
+    
+    me = await client.get_me()
+    logger.info(f"✅ Вошли как: @{me.username} ({me.first_name})")
     
     # Запускаем автопостинг
-    asyncio.create_task(auto_post_loop())
+    asyncio.create_task(auto_loop())
     
-    # Держим бота активным
-    await asyncio.Event().wait()
+    # Работаем бесконечно
+    await client.run_until_disconnected()
 
 
 if __name__ == '__main__':
-    app.run(main())
+    client.loop.run_until_complete(main())
