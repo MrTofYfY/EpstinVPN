@@ -67,41 +67,75 @@ async def handle_channel_post(message: Message):
     Обработчик сообщений из каналов.
     """
     try:
-        # Проверяем, что сообщение из нужного канала
-        if message.chat.username:
-            channel_username = f"@{message.chat.username}"
-        else:
-            channel_username = str(message.chat.id)
+        # Получаем информацию о канале
+        channel_id = message.chat.id
+        channel_username = f"@{message.chat.username}" if message.chat.username else None
+        channel_title = message.chat.title or "Unknown"
         
-        # Проверяем источник
-        source_match = (
-            channel_username == SOURCE_CHANNEL or 
-            str(message.chat.id) == SOURCE_CHANNEL.replace('@', '').replace('-100', '')
-        )
+        logger.info(f"📨 Новое сообщение!")
+        logger.info(f"   ID канала: {channel_id}")
+        logger.info(f"   Username: {channel_username}")
+        logger.info(f"   Название: {channel_title}")
         
-        if not source_match:
+        # Проверяем, это нужный канал?
+        source_channel_clean = SOURCE_CHANNEL.strip().lower()
+        
+        # Варианты проверки
+        is_match = False
+        if channel_username:
+            is_match = channel_username.lower() == source_channel_clean
+        
+        # Проверка по ID (если SOURCE_CHANNEL это ID)
+        if not is_match and SOURCE_CHANNEL.lstrip('-').isdigit():
+            is_match = str(channel_id) == SOURCE_CHANNEL or str(channel_id) == SOURCE_CHANNEL.replace('-100', '')
+        
+        logger.info(f"   Это исходный канал? {'✅ ДА' if is_match else '❌ НЕТ'}")
+        logger.info(f"   Ожидается: {SOURCE_CHANNEL}")
+        
+        if not is_match:
+            logger.info("   ⏭️ Пропускаем (не тот канал)")
             return
         
+        # Получаем текст сообщения
         text = message.text or message.caption or ""
         
-        logger.info(f"Получено новое сообщение из канала {channel_username}")
+        if not text:
+            logger.info("   ⏭️ Пропускаем (нет текста)")
+            return
         
-        # Проверяем, соответствует ли сообщение нужному паттерну
+        logger.info(f"   📝 Текст сообщения:\n{text[:200]}...")
+        
+        # Проверяем паттерн
+        has_time = bool(re.search(r'🕒\s*\d{1,2}:\d{2}\s*\(МСК\)', text))
+        has_date = bool(re.search(r'🗓️\s*\d{2}\.\d{2}\.\d{4}', text))
+        has_rare = '🚨 РЕДКИЙ ТОВАР!' in text or 'РЕДКИЙ ТОВАР' in text
+        has_count = bool(re.search(r'\[\d+\s+шт\.\]', text))
+        
+        logger.info(f"   Проверка паттерна:")
+        logger.info(f"      ⏰ Время: {has_time}")
+        logger.info(f"      📅 Дата: {has_date}")
+        logger.info(f"      🚨 Редкий товар: {has_rare}")
+        logger.info(f"      📦 Количество: {has_count}")
+        
         if check_message_pattern(text):
-            logger.info("Сообщение соответствует паттерну, пересылаем...")
+            logger.info("   ✅ Сообщение подходит! Отправляем...")
             
-            # Отправляем сообщение в целевой канал
-            await bot.send_message(
-                chat_id=TARGET_CHANNEL,
-                text=text
-            )
-            
-            logger.info(f"Сообщение успешно отправлено в {TARGET_CHANNEL}")
+            try:
+                # Отправляем сообщение в целевой канал
+                sent_message = await bot.send_message(
+                    chat_id=TARGET_CHANNEL,
+                    text=text
+                )
+                logger.info(f"   ✅ Успешно отправлено в {TARGET_CHANNEL}")
+                logger.info(f"   ID отправленного сообщения: {sent_message.message_id}")
+            except Exception as send_error:
+                logger.error(f"   ❌ Ошибка отправки: {send_error}")
+                logger.error(f"   Проверьте права бота в канале {TARGET_CHANNEL}")
         else:
-            logger.info("Сообщение не соответствует паттерну, пропускаем")
+            logger.info("   ❌ Сообщение не подходит по паттерну, пропускаем")
             
     except Exception as e:
-        logger.error(f"Ошибка при обработке сообщения: {e}")
+        logger.error(f"❌ Критическая ошибка при обработке: {e}", exc_info=True)
 
 
 @dp.message(Command("start"))
@@ -156,3 +190,4 @@ if __name__ == '__main__':
         logger.info("Бот остановлен пользователем")
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
+        
